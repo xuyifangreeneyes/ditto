@@ -1,4 +1,4 @@
-# My notes on some papers and textbooks
+# Aurora
 
 a failure in durability can be modeled as a long- lasting availability event, and an availability event can be modeled as a long-lasting performance variation 
 这句啥意思？？
