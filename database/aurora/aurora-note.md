@@ -63,7 +63,7 @@ Note：
 
 ![Network IOs for Aurora vs MySQL](compare.png)
 
-感觉这里没有做严谨的消融实验。网络 IO 的下降来自于只传 redo log 不传数据，代价是存储层更高的存储层 cpu 消耗。那么吞吐的提供多大比例来自于只传 redo log，多大比例来自于 quorum write（6/4 的 latency 优于 4/4），多大比例来自于分片带来的并行。没有 quorum 和分片情况下，只传 redo log 降低网络开销，吞吐会有多少提升。Aurora 的存储层藏了 N 个节点（100G 数据，有 10 个 PG，每个 PG 有 6 个 segment，最奢侈的情况下可以用 60 个存储节点），跟 MySQL 比是不是有点不讲武德。
+感觉这里没有做严谨的消融实验。网络 IO 的下降来自于只传 redo log 不传数据，代价是存储层更高的 cpu 消耗。那么吞吐的提供多大比例来自于只传 redo log，多大比例来自于 quorum write（6/4 的 latency 优于 4/4），多大比例来自于分片带来的并行。没有 quorum 和分片情况下，只传 redo log 降低网络开销，吞吐会有多少提升。Aurora 的存储层藏了 N 个节点（100G 数据，有 10 个 PG，每个 PG 有 6 个 segment，最奢侈的情况下可以用 60 个存储节点），跟 MySQL 比是不是有点不讲武德。
 
 Aurora 存储层的设计原则是尽可能降低 foreground write latency。尽可能把写入流程中的大部分操作放到后台进行。如果后台需要的操作太多了，也可以停一停 GC，降低 cpu 的压力。
 
@@ -86,7 +86,7 @@ Note:
 7. 周期性 GC 掉旧版本没人读的 page。
 8. 用 crc 校验 page 数据正确性和完整性。
 
-Foreground write lantency 只有 1、2 两步会影响。
+Foreground write latency 只有 1、2 两步会影响。
 
 ## Details
 
