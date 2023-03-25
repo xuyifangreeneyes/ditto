@@ -104,159 +104,50 @@ Note：
 3. CPL（Consistency Point LSN）。数据库级别的一个事务可能有多条语句组成，作者说数据库级别的事务可以拆成一个个 MTR（mini-transaction）。我理解这里的 MTR 可以是跟单条语句对应，也可以是其他粒度的拆分。然后 MTR 可能对应一条或者多条 redo log。一个 MTR 的多条 redo log 的最后一条是 CPL,非最后一条的 redo log 不是 CPL。比如一条 insert 语句是 MTR，但在 b+ 树上可能要写多个 page（可能有 split page 之类的操作），每个 page 的写入对应一条 redo log，一次一个 MTR（这里就是 insert 语句）对应多条 redo log。如果存储层 apply 了这多条 redo log 里的一部分，那么这颗 B+ 树处于一个不 consistent 的状态，不应该被上层看见。如果存储层我理解数据库级别的事务（多个 MTR 组成）的原子性由计算层来保证，但 MTR 的原子性需要由存储层来保证，这也是为什么引入 CPL 的原因。如果存储结构很简单，每个 MTR 都对应一条 redo log，那么每条 redo log 都是 CPL。
 4. VDL（Volume Durable LSN）：不超过 VCL 的最大的 CPL。在 crash recovery 的时候，如果只清掉 LSN 大于 VCL 的日志，那么有可能会让一个不 consistent 的存储结构（比如 B+ 树）的状态暴露出去。因此，我们需要清掉所有 LSN 大于 VDL 的日志。
 
-https://pdos.csail.mit.edu/6.824/notes/l-aurora.txt
+进行写操作时，计算层通过 quorum write 把 batch log 写进存储层，然后把 VDL 往前推。计算层在分配 LSN 生成 redo log 时，LSN 有个上限，是 VDL + LAL（LSN Allocation Limit，一般是 10 million）。这能起到反压的作用，避免计算层生成太多的 redo log 而存储或者网络跟不上的情况。
 
-跨 AZ 流量，多贵，latency 高？
+注意每个 segment 只会收到跟它包含的 page 有关的 redo log。然后 redo log 之间会维护一个链式结构，用来发现哪些 redo log 没有收到，要从 peer 那里去补回来。每个 segment 会维护一个 SCL（Segment Complete LSN），表示 SCL 以及之前的 redo log 都有了。每个 segment 有 SCL 以后 gossip 补日志就比较方便。
 
-6/4/4 用户需要这么高的可用性吗
+Aurora 的事务提交操作是完全异步的。当收到一个 commit 请求时，处理请求的线程把这个事务放到一个列表里以后就切换 context 去做其他事情了。这个列表里的事务都是在等 commit 完成的。然后当且仅当最新的 VDL 大于等于这个事务 commit 的 LSN 的时候，commit 完成。因此当 VDL 向前推进的时候，会检查列表里那些事务已经 commit 了，然后用一个专门的线程向客户端发送 commit ack。这个过程中是没有同步阻塞的。
 
-database-server on ec2 防止脑裂，etcd 选主就行，或者 lease 选主
-A murky aspect of Aurora is how it deals with failure or partition of
-the main database server. Somehow the system has to cut over to a
-different server, while ruling out the possibility of split brain. The
-paper doesn't say how that works. Spanner's use of Paxos, and avoidance
-of anything like a single DB server, makes Spanner a little more clearly
-able to avoid split brain while automatically recovering from failure.
+Note：
+1. 这个我不太明白事务 commit 的 LSN 具体指什么？是指这个事务最后一个语句（或者最后一个 MTR）的最后一条 redo log 的 LSN 吗？感觉应该不是，否则就检查不出 commit 语句到底是执行了还是没执行。所以 commit 语句自己也有一条 redo log 以及 LSN 吗？应该是的。
+2. 一开始不太理解 the equivalent to the WAL protocol is based on completing a commit, if and only if, the latest VDL is greater than or equal to the transaction’s commit LSN 这个充分必要条件。从 VDL >= txn commit LSN 推出 commit 已经完成好理解。反方向一开始不太理解。后来想起来 crash recovery 的时候会把 VDL 之后的 redo log 都清掉，那确实 commit 的时候得保证 VDL 推过 txn commit LSN 了，否者这个事务的 redo log 就有被清掉的风险。
+3. 执行普通语句的时候，对应所有的 redo log 都完成了 quorum write 就返回，这种情况下 VDL 可能还没有推到这条语句的最后一条 redo log 的 LSN 那里。因为有可能另一条语句比这条语句先开始但目前还没结束。在 crash recovery 的时候这条语句对应的 redo log 被清掉没关系，因为反正它还没 commit。
+4. 是不是不能 apply 那些 LSN > VDL 的 redo log。Crash recovery 的时候会把 VDL 之后的 redo log 都清掉，但它们如果已经污染了 page 感觉会挺麻烦。不如别 apply 那些 LSN > VDL 的 redo log。
 
+跟 MySQL 以及大部分其他数据库一样，计算节点上有 buffer cache，只有访问的 page 不在 buffer cache 里的时候，会去访问存储层。MySQL 在 buffer cache 满了需要 evict page 的时候，如果被 evict 的 page 是脏的，需要写回磁盘。Aurora 计算节点不需要写回脏页。它用另一种策略保证 buffer cache 里读到的版本是最新的，就是只有当 page LSN （这个 page 上一次改动对应的 redo log 的 LSN）大于等于 VDL 的时候才会 evict page。这能保证两点：
+1. 所有在 page 里的改动都在已经持久化的 redo log 里了。
+2. 如果 cache miss 了，只要从 VDL 这个时间点读一个 page，读到的就是最新的持久化的版本。
 
-quorum 和 raft/paxos 的不同
- 
-quorum 
+Note：
+1. Aurora 不用写回脏页是因为 redo log 已经在存储层持久化了，想要哪个版本的 page 直接对最早版本 page 进行 apply redo log 的操作就行。
+2. 不太理解为啥 buffer cache 里会有 page LSN >= VDL 的存在。下文会提到读都是以当前 VDL 为时间点去读 snapshot 的，不应该会有 page LSN >= VDL 的 page 被读上来。猜测在写操作的时候，因为 redo log 是物理的，要关联到具体的 page，所以写操作的时候也需要把 page 读上来用以产生 redo log，写操作的 redo log LSN 有可能推到 VDL 之后，这种情况下就会产生 page LSN >= VDL 的情况。而这些没有 commit 的写是不应该被读看见的，所以要 evict 掉。但我不太理解为啥是 page LSN >= VDL 而不是 page LSN > VDL。
 
-read after write
-only for kv 
+读操作并不需要使用 quorum read。当进行读操作的时候，首先会把当时的 VDL 作为这个读操作的 read point。因为 read point 都是 CPL，不需要担心读操作看见执行多条 redo log 组成的 MTR 时存储结构处于不 consistent 的状态。因为每个 segment 的 SCL 都维护着，我们会去找 SCL > read point （感觉 SCL >= read point 也可以？这里是有啥微妙细节吗）的 segment 去读数据。如果没有一个 SCL 比 read point 大，那么可能得等 segment 之间 gossip 补齐一下 redo log 才能去读。
 
-6/4/4
+因为我们知道有哪些读操作还没完成（包括 primary instance 和 replica instance 上的），这样就可以计算出 PGMRPL（Protection Group Min Read Point LSN）。论文中把 PGMRPL 叫做 low water mark。因为所有的 read point 都要大于等于 PGMRPL，存储节点就可以放心大胆地把 PGMRPL 之前的 redo log 都 apply 完以后 GC 掉。
 
-cannot vote on content! 啥意思
+Note：
+1. 因为不同的读操作可能有不同的 read point，我总感觉在计算层的 buffer cache 以及在存储层都可能有多版本的 page。因为如果只有最早版本的 page（PGMRPL 之前的版本）和一串 redo log，不同 read point 的读请求过来的时候，会反复 apply redo log 产生想要的那个版本的 page，感觉反复 apply 同一个 redo log 可能有点白白浪费的感觉。但同时保留多版本又会有较大的内存（对于 buffer cache 来说）或者磁盘（对于存储节点来说）开销。可能这是空间和时间上的 trade off 了。
 
-调节读写比？
+然后作者说并发控制是在计算节点上的，沿用 MySQL 的就行。然后 undo segments 也是在计算节点的本地盘上。这点我不太理解，万一计算节点的本地盘坏了，那进行到一半的事务不就都回滚不了了。
 
-version 号
+Aurora 可以支持最多 15 个低延迟的读副本。有点好奇为啥是 15，再多的话是没需求还是有啥瓶颈。Writer 或者说 primary instance 会把 log 流源源不断地发给读副本。读副本看到一个 redo log，发现关联的 page 在 buffer cache 里，就会 apply redo log，否则丢掉 redo log（反正关联的 page 要用了可以去存储层拿）。然后只有 LSN <= VDL 的 redo log 可以 apply（不应该读到还没提交的内存）。然后属于同一个 MTR 的多个 redo log 的 apply 必须是原子的，否则读操作就能看到存储结构不 consistent 的状态了。在现实情况里读副本一般有 20ms 左右的延迟。读副本还可以通过 log 流知道每个事务开始和结束的时间，从而实现 snapshot isolation。
 
-dead or slow server，
+传统数据库（比如 MySQL）要定期做 checkpoint，然后 crash recovery 的时候从 checkpoint 开始 apply redo log 恢复到崩溃时候的状态，并用 undo log 撤掉还未提交的事务。因为 checkpoint 操作比较重，不能频繁做，所以 crash recovery 注定要 apply 比较多的 redo log，是比较慢的。Aurora 把 forward processing path 和 crash recovery 统一成用同一个 redo log applicator。这使得 Aurora 的 crash recovery 很快（10s 左右）。这里我觉得 Aurora 不需要做 checkpoint 的原因是它本身存储层的数据的 durability 已经得到保证，不怕偶尔有块盘坏掉的情况。
 
-raft/paxos
+Crash recovery 可以在计算层没有的时候就开始进行。对于每个 PG，用 quorum read 去确认哪些 redo log 完成了 quorum write，然后计算出 VDL，然后 truncate VDL 之后的所有 redo log。在做 truncation 的时候还要在存储层稍微记点信息，防止 crash recovery 中途又挂了再拉起来的时候不确定 truncation 到底有没有做过。
 
-gossip catch up
+## Up To Cloud
 
-线性一致性
+然后作者向我们展示了 Aurora 在云上大概长什么样。(就不打算出一个 op 部署的方案吗)
 
-事务是构建在 kv 之上，
-tikv 能用 quorum 吗，quorum 能分片吗 cassendra/dynamo 对等的产品？
+![Aurora Architecture: A Bird's Eye View](cloud.png)
 
+其中 HM（Host Manager）是来监控集群是否健康，如果哪个实例状态不正常就起个新的把旧的换掉。然后搭了三个 VPC。Customer VPC 是用户应用和计算节点交互用的。RDS VPC 是计算节点以及 control plane 交互用的。Storage VPC 是计算节点以及存储服务交互用的。存储服务是部署在 EC2 集群上的，每个存储节点会有自己本地的 SSD。然后 backup/restore 操作是跟 S3 交互的。存储服务的元数据是存在 DynamoDB 上的。
 
-Note
-  Raft uses quorums too
-    Leader can't commit unless majority of peers receive
-    R/W overlap guarantees new Raft leader sees every committed write
-  Raft is more capable:         
-    Raft handles complex operations, b/c it orders operations.
-    Raft changes leaders automatically w/o split brain.
+## Some Thoughts
 
-
-aurora 能不能支持多写？为什么不能？
-A huge difference is that Aurora is a single-writer system -- only the
-one database on one machine does any writing. This allows a number of
-simplifications, for example there's only one source of log sequence
-numbers. In contrast, Spanner can support multiple writers (sources of
-transactions); it has a distributed transaction and locking system
-(involving two-phase commit).
-LSN 有一个全局的 ground truth 可以吗，这样就无法避免 2pc 吗
-多写就很复杂了。
-
-
-没有消融实验
-
-log only vs full data
-
-4/4 vs 6/4
-
-faster network RDMA
-PolarDB
-
-
-Any read request for a data page may require some redo records to be applied if the page is not current. 
-这个单机的 MySQL 不能做吗
-
-no buffer pool in storage node --> replica node to read so no buffer pool is needed.
-
-PG 是物理分片吗 yep
-
-http://nil.lcs.mit.edu/6.824/2020/papers/aurora-faq.txt
-
-undo local disk 高可用，没必要？
-
-
-write path 
-
-commit 异步处理，那么 commit 需要一条 redo log 吗，mysql 里有吗
-
-As a list of relevant pending log entries per data page.
-没见过存储结构的时候不知道 redo log 属于哪个 data page？
-
-apply log 的时候可以超过 VDL 吗，crash recovery 的时候需要 undo log 取消？不如不超过 VDL。。。会被 PGMRPL 卡住，但没有读的时候应该也不会超过 VDL
-
-  DB finds highest log record such that log is complete up to that point.
-    Log record exists if it's on any reachable storage server.
-    The VCL (Volume Complete LSN) of Section 4.1.
-  DB tells storage servers to delete all log entries after the VCL.
-  DB issues compensating "undo" log entries for transactions that
-    started before VCL but didn't commit. 
-
-VCL or VDL
-
-read path
-事务性 read committed 依赖于上层
-读 VDL page 不能保证 read committed
-replica 上的读写可见性？
-
-  DB server reads from any storage server whose SCL >= highest committed LSN. highest committed LSN 跟 read-point 不太一样，约束更强，能保证 read committed
-    That storage server may need to apply some log records to the data page.
-
-
-找到的满足SCL>=read-point的segment有hole？可能吗？不可能，看SCL的定义。需要gossip补一下以后才行？可能的，有可能所有的 SCL 都 < read-point，这时候要 gossip 补一下才行。
-
-为啥会有 cache page LSN >= VDL 
-
-6 份能优化吗，每个 AZ 一份写 log apply log 另一份只写 log，定期从兄弟那里拿 checkpoint 恢复会慢一点吗
-
-
-sysbench
-MySQL 的五倍性能
-
-PostgreSQL 的三倍性能
-
-重启时间缩短到 60 秒以下。
-
-why 15 replicas
-支持最多 15 个低延迟只读副本
-
-cache miss 的时候大概率读同 AZ 的 storage node，小概率读跨 AZ 的 storage node?
-
-recovery
-
-aurora 的 recovery 感觉 mysql 也能做，为啥不能做
-
-并行恢复
-
-aurora 比 mysql 省成本
-
-很云原生，都不能 op 部署
-
-write on writer and read on replica 能符合事务吗
-
-share-nothing
-支持多写，更高的可扩展性
-从 NoSQL 运动中回归到关系型数据库 
-兼容性很痛苦
-
-share-everything
-单机到分布式的一次扩展
-easy to extend from mysql/pg
-不支持多写
-
-## Reference
-
-1. https://pdos.csail.mit.edu/6.824/notes/l-aurora.txt
-2. http://nil.lcs.mit.edu/6.824/2020/papers/aurora-faq.txt
+1. 比较好奇 Aurora 的成本大概是多少，存储层怎么计费啥的（之后去翻翻官网研究一下）。以及真的那么多用户需要 AZ + 1 的容灾能力吗。
+2. 网上有很多 Aurora share storage vs F1/Spanner share everything 的优劣对比，主要的是 F1/Spanner share everything 支持多写，有更好的可扩展性，Aurora share storage 可以复用传统数据库上层逻辑，不用受兼容性折磨，等等。我自己一个模糊且不准确的印象是，F1/Spanner 更像是人们重新想起 sql 和事务以后从 NoSQL 的回归，而 Aurora 更像是从传统数据库往分布式迈出的一步。 
