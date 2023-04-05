@@ -122,140 +122,70 @@ Note：
 第二条理由我能理解，但第一条我没懂是啥意思。
 
 Note：
-1. 即使在单机内存数据库里 bushy parallelism 用处有限且在 cache locality 等方面有负面作用，但我觉得 bushy parallelism 可能在其他场景下还是有价值的，比如更大规模的数据量、多节点分布式计算（对 cache locality 没那么敏感）、计算资源充足、想尽可能充分并行的场景？ 我联想到另外一个有趣的事实，很多数据库在 join reorder 的时候只考虑 left-deep tree，不考虑 bushy tree。我印象里的原因是 bushy tree 左右孩子并行执行的内存开销会很大，单节点可能撑不住，jiang'di。但多节点分布式计算的情况下通过 exchange data 可以避免单节点巨大的内存开销，这种情况下 bushy tree 应该有用武之地，简单查了一下发现 MaxCompute 是做了 bushy tree 的。有点好奇有没有论文专门讨论 bushy parallelism / bushy tree 在各个场景下的优劣以及什么场景适合。
+1. 即使在单机内存数据库里 bushy parallelism 用处有限且在 cache locality 等方面有负面作用，但我觉得 bushy parallelism 可能在其他场景下还是有价值的，比如更大规模的数据量、多节点分布式计算（对 cache locality 没那么敏感）、计算资源充足、想尽可能充分并行的场景？ 我联想到另外一个有趣的事实，很多数据库在 join reorder 的时候只考虑 left-deep tree，不考虑 bushy tree。我印象里的原因是 bushy tree 左右孩子并行执行的内存开销会很大，单节点可能撑不住，还有一个原因就是搜索空间会变大。但多节点分布式计算的情况下通过 exchange data 可以避免单节点巨大的内存开销，这种情况下 bushy tree 应该有用武之地，简单查了一下发现 MaxCompute 是做了 bushy tree 的。有点好奇有没有论文专门讨论 bushy parallelism / bushy tree 在各个场景下的优劣以及什么场景适合。
 2. 仔细看了 HashJoin(HashJoin(Filter(R), Filter(S)), Filter(T)) 三条 pipeline 的切分，感觉似乎这种切分方式不是并行最大化的。DataSource(S)->Filter->HashBuild1 构建完第一个 probe 就可以开始做了，不需要两个 hash table 都构建完才开始第一个 probe。可能因为三条 pipeline 的切分比较简单，或者有其他方面优势，所以放弃了更充分利用并行的方式（从 HyPer 拒绝 bushy parallelism 看并行最大化并不是唯一的优化目标，有时候节约内存或者简化实现更重要）。一般来说，hash join 需要 hash table 构建完成才能开始执行 probe 端，无论是 Volcano 模型（Pull）还是 Pipeline 模型（Push）都是如此。但这里其实有个细节，有些算子从开始执行到吐出第一行可能会花费很长时间（比如一些要物化中间结果的算子，sort，topk，hash join 等），在一些优化器的代价模型里甚至有个变量描述从开始执行到吐出第一行的时间。并不是说 hash table 构建完成才能开始执行 probe 端的算子，而是 hash table 构建完成才能让 probe 端算子吐出第一行数据。所以在 hash table 构建的时候，probe 端如果是要物化中间结果的算子，也可以并行地执行起来，然后到 hash table 构建好的时候就可以立马吐出第一行数据。不太确定有没有什么数据库的实现里 build hash table 的同时会并发开始执行 probe 端。这种 bushy parallelism 能更充分地并行，但也可能带来负面作用（比如更大的内存开销）。
 
+作者还提了一下 kill query 的实现。一旦一个 query 被标记上 kill，它的所有未完成的 task 都不会再进行。在 task 粒度上实现的 kill query 能高效地终止查询。相比之下，Volcano 模型每次调用 next 前后检查是否 kill 可能还不够，比如 hash join 调用第一次 next 的耗时可能非常久（在构建 hash table），出现 kill 执行了以后 query 迟迟没终止的情况。这种情况需要在算子实现内部添一些 kill 检查。
+
+然后作者讨论了一下 morsel size。Morsel size 如果太小的话，会造成 task 过多且一个 task 很快就跑完，进而频繁调用 dispatcher 的逻辑成为瓶颈。Morsel size 太大的话，elasticity 和 load balance 都会打折扣。作者简单做了个实验，发现 morsel size 在 10000 的时候 dispatcher overhead 就基本可以忽略了，所以默认把 morsel size 就设置成 10000。
+
+Note：
+1. 作者提到 in contrast to systems like Vectorwise and IBM’s BLU, which use vectors/strides to pass data between operators, there is no performance penalty if a morsel does not fit into cache。向量化的时候 chunk 太大塞不进 cache 的 performance penalty 分析后面得去再读一下原文。
+
+然后作者提到即使 dispatcher 用了无锁结构，还是容易成为限制 scalability 的瓶颈。作者表示考虑到以下几点，这个问题在现实中其实还好：
+1. In our implementation the total work is initially split between all threads, such that each thread temporarily owns a local range. Because we cache line align each range, conflicts at the cache line level are unlikely. Only when this local range is exhausted, a thread tries to steal work from another range. 我理解主要是两点，第一点是 dispatcher 的数据结构似乎被切成了若干个 range，每个 thread 优先去访问 local range。但这里说得太模糊了，不太清楚 split range 具体是怎么样的。第二点是 cache line align，应该是避免出现 false sharing。
+2. If more than one query is executed concurrently, the pressure on the data structure is further reduced. 我理解是 query 多了并发访问 dispatcher 时的冲突也会减少，但没写具体实现也很难深入讨论。
+3. It is always possible to increase the morsel size. 实在没办法就调大 morsel size 呗。
+
+## Parallel Operator Details
+
+然后讲讲各个算子怎么切成小的 task 实现 data parallelism。
+
+### Hash Join
+
+在 build hash table 阶段，第一步是每个 worker thread 先把 input tuples 写到自己的 local memory 里。第一步完成后，hash table 的 perfect size 知道了，第二步是把指向 tuple 的指针插入到一个大小固定不需要扩容的 hash table 中。如果是 outer join 且 build 端是 outer 端，那么 tuples 里会多一个 marker。在 probe 的时候如果匹配会把 marker 设置一下。Probe 完成以后会再扫一遍 hash table 把 marker 没设置的 tuples 读出来。
+
+![Lock-free insertion into tagged hash table](hashtable.png)
+
+如上图所示，hash table 是一个无锁实现。作者做了一个 early-filtering 的优化，在 probe 的时候，如果 16bit tag 告诉我们这个元素不存在，那就不用费劲去链表里再匹配了，类似 Bloom filter。为了省空间，链表头部的 64bit int 拆成了 16 bit tag 加上 48bit pointer，更新的时候可以利用 CAS 把 tag 和 pointer 进行原子化更新。作者表示利用 CAS 进行无锁 insert 的算法是建立在我们知道 hash join 中对 hash table 是先 insert 完再 lookup 的前提下，但我其实没想明白没有这个前提的话 insert 和 lookup 会有问题吗。这个 early-filtering 的技巧在大部分 key 是 unique 的情况下进行 aggregation 的时候也可以利用上。
+
+作者还对 hash table 进行了一些 OS 层面的优化。比如用 2MB 的大页，这样可以减少 TLB miss，页表可以放进 L1 cache，减少 page fault。作者给 hash table 申请内存是用 mmap，这里我不太理解，hash table 是暂存在内存里的，不用落盘，为啥要用 mmap。大多数操作系统分配内存是 lazy 的，当一个 page 被某个 worker thread 写的时候才会真正在对应的 local memory 里申请内存。因此如果很多 worker thread 在 hash table 上进行 insert，那么 hash table 是 pseudo-randomly interleaved over all nodes。如果只有一个 worker thread 在 hash table 上进行 insert，那么 hash table 就完全在对应的 local memory 里。
+
+### Table Partitioning
+
+为了实现 NUMA-local table scan 的时候，我们需要把 tuples 均匀地分配在各个 NUMA 节点的内存中。最简单的方式就是 round-robin。但其实有时候按某个重要的列（比如主键、外键）的 hash value 进行内存层面的 partition 会更好。举个例子，TPCH 里的 orders 和 lineitem 都有 orderkey，两张表都按 orderkey 的 hash value 在内存层面进行 partition，然后有查询是 orders 和 lineitem 以 orderkey 为 join key 进行 join，假设 build hash table 的时候也用同一个 hash function，那么很可能 build 端的 tuples、hash table 里的对应部分、probe 端的 tuples 都在同一个 local memory 里，cross-socket communication 大大减少，性能提高。
+
+Note：
+1. 其实这种观察 workload 然后精心设计 partition 方案的操作在很多分布式数据库里也常见，为了尽可能实现 local join 或者 local txn，降低网络开销。
+
+### Aggregation
+
+![Parallel aggregation](agg.png)
+
+HyPer 的 Aggregation 算法是一个典型的 2-phase agg。第一阶段是 thread-local agg，这里作者用了一个巧妙的做法，能同时应对 local ndv 很大和 local ndv 很小的情况。比如在 local ndv 很小的时候做 local agg 效果好，但 local ndv 很大的时候 local ndv 不如不做。这里的 thread-local agg 是开了一个 thread-local, fixed-sized hash table，如果 hash table 满了且 key 不在 hash table 里，那么对这个 key 直接放弃 agg 操作。如果 local ndv 很小，那么 fixed-sized hash table 大概率能装下所有 key，几乎等价于做了 local agg；如果 local ndv 很大，那么对大部分 tuples 而言其实都没做 local agg。感觉这种方式要比让优化器决定是否做 local agg 更优雅。同事告诉我很多 AP 数据库都用了这个技巧，在 StarRocks 里这个技巧叫 AggregateStreaming（[StarRocks 聚合算子源码解析](https://zhuanlan.zhihu.com/p/592058276)）。另外第一阶段还会对数据做 hash partition，然后第二阶段每个 worker thread 的任务就是完成单个 partition 上的 agg。可以看到这个 NUMA-aware 2-phase agg 和 MPP 数据库里的 2-phase agg 非常类似。只不过前者是要充分利用 multi-cores 并减少 cross-socket communication，而后者是要充分利用 multi-nodes 并减少 network communication。
+
+### Sort
+
+![Parallel merge sort](sort.png)
+
+HyPer 的 Sort 算法也是一个两阶段的 merge sort。第一阶段就是 local sort。然后在 local sort 的结果中定出 local separator。然后根据 local separator 计算出 global separator。然后根据 global separator 给 worker thread 划分出各自 merge 哪一段 range。这里的难点是如何通过 local separator 计算出 global separator，确保依据 global separator 划分出的各段 range 没有太大的 data skew。作者采用了类似 median-of-medians 的算法，具体没有细说。比如最简单的只有一个 separator 的情况（global separator 把 range 一分为二），我猜是根据 median-of-medians 算法算了一个近似中位数，近似误差控制在一个范围里。
+
+Note：
+1. 感觉 median-of-medians 算法挺有趣的，我看了这篇[BFPRT——Top k问题的终极解法](https://zhuanlan.zhihu.com/p/291206708)。
+
+## Evaluation
+
+作者在 TPC-H 上对比了 HyPer 和 Vectorwise 的性能，机器是32核64线程的 Nehalem EX，结果如下：
+
+![TPC-H scalability on Nehalem EX (cores 1-32 are real, cores 33-64 are virtual)](eval1.png)
+
+随着使用的 core 的个数的增加，HyPer 展现出比 Vectorwise 更强的 scalability。消融实验也证明了 NUMA-aware 对性能很重要。
+
+![TPC-H (scale factor 100) statistics on Nehalem EX](eval2.png)
+
+这个表里其他数据都符合预期，但 QPI 的数据有点奇怪。文中提到 The "QPI" column shows the utilization of the most-utilized QPI link (though with NUMA-awareness the utilization of the links is very similar)。HyPer 是 NUMA-aware 的，大多数是 local memory access，而 VectorWise 并不是 NUMA-aware 的，然后 VectorWise 的 QPI 要比 HyPer 低。作者注释写了 The QPI links are used both for sending the actual data, as well as for broadcasting cache coherency requests, which is unavoidable and happens even for local accesses. Query 1, for example, reads 82.6GB/s, 99% of it locally, but still uses 40% of the QPI link bandwidth. 但感觉还是有些奇怪。
 
 
+##  Some Thoughts
 
-
-
-
-pipeline 最优并行的方式 
-hashtable build 并行
-first row start
-
-单查询 intra-operator 并行
-join order
-
-
-volcano 模型：并发隐藏在算子里，shared state is avoided,
-
-
-pipeline 概念感觉很模糊，jit 是 operator level 吗
-
-vector-at-a-time 就是向量化吧
-
-jit + vector hyper 都有。。。
-
-refregment to avoid skew 所有情况下都适用吗，hash build 就不适用吧
-
-In order to write NUMA-locally and to avoid synchronization 
-写 local 可以避免同步？？ again numa mem arch 是怎么样的
-
-
-To preserve NUMA-locality in further processing stages, the storage area of a particular core is locally allocated on the same socket.
-
-same socket
-
-numa 的内存沟通是走 socket 吗
-
-fig3 似乎没有
-
-global hash table 会被不同 socket 上的 thread 访问
-
-如果放在一个 numa local area 里会有很多竞争吗，交通不均衡？？
-
-具体怎么放呢，lb？？
-
-pipeline 依赖关系 dag，（内存消耗会比 pull 模型多吗，三表 hash join 那里好像没有，都得物化
-
-
-Preemption of a task occurs at morsel boundaries – thereby elimi- nating potentially costly interrupt mechanisms.
-
-没有 oi 操作，没有阻塞。
-
-pull vs push pull 天然带流控
-
-The dispatcher’s code is then executed by the work- requesting query evaluation thread itself
-
-应该还有一些去 dispatcher 里放任务的工作吧，比如一个 pipeline 的依赖都完成了，要把它放进 dispatcher 里，这种是低频操作？而且 morsel 队列可以由 worker 自己更新。
-
-pipeline 的添加也可以用 worker 完成？yep
-
-内存数据库落盘策略啥的
-
-bushy parallelism
-两个 hash table building 不能并行
-
-一个 morsel 大概要执行多久
-
-kill next 粒度控制
-
-false sharing 
-mesi 协议
-
-一个集中的数据结构管理线程
-好处，自己执行调度规则
-坏处，很难写，容易变成瓶颈，
-
-Second, if more than one query is executed concurrently, the pressure on the data structure is further reduced.
-减少竞争
-
-hash join
-outer side is build side
-marked
-probe 完再扫一遍，这个也可以 morsel-driven 吗
-
-perfect hash size
-collision
-
-tagging is also very beneficial during aggregation when most keys are unique.
-agg 的时候怎么用
-
-mmap
-hash table 是中间结果，干嘛落盘
-
-numa aware 的技巧是不是跟多节点 shuffle 数据的技巧异曲同工
-
-local join 好像跟它说的 hash join 不太一样，哦 mmap 写的时候大概率是 local 的
-
-2-phase agg 好像 tidb mpp 啊
-
-blu agg
-fixed size hash + partition
-对 ndv 很大或者很小都考虑了
-
-ndv 很小，直接进 hash table
-ndv 很大，建大的 hash table 得不偿失，所以直接 partition。
-
-In main memory, hash-based algorithms are usually faster than sorting [4]. Therefore, we currently do not use sort-based join or aggregation, and only sort to implement the order by or top-k clause.
-
-这跟 ap mpp 很像，全是 hash join，hash agg 基本不考虑 order/sort
-
-medium of medium
-
-列存读数据读块
-有个多列合并的操作吗
-
-data skew from volcano 能举个例子吗
-partition->filter
-有其他例子吗
-
-fixed workload division, compile time, skew
-depend on stats or not
-
-adaptive morsel-wise processing 
-work-stealing 吗
-
-每个 morsel 要跑多久，一个 query 大概包含多少 morsel task
-
-比 volcano 相比切的足够小，等最后一个的时间大大降低了。
-
-resource control 好做
-
-多租户
-
-资源管控
-
-限流
+1. Morsel-Driven Parallelism 的影响深远，如今在很多 OLAP 数据库上（比如 ClickHouse、DuckDB 等）都能看到它的影子。
