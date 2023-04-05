@@ -62,7 +62,7 @@ Note：
 
 ![Parallellizing the three pipelines of the sample query plan: (left) algebraic evaluation plan; (right) three- respectively four-way parallel processing of each pipeline](three-tables-hashjoin2.png)
 
-每一个查询都有一个 QEPobject，会维护 pipeline 之间的依赖关系。当某个 pipeline 的依赖都执行完以后，QEPobject 会把这个 pipeline 交给 dispatcher，让后者把这个 pipeline 的 tasks 分发给不同线程。QEPobject 还负责申请用来写中间结果的临时内存。当中间结果全部完成时，会把中间结果等分成若干 morsel，作为后继任务的划分依据，这种 re-fragment 可以避免 data skew，使得每个 task 的工作量都几乎相等。原话是 after completion of the entire pipeline the temporary storage areas are logically re-fragmented into equally sized morsels; this way the succeeding pipelines start with new homoge- neously sized morsels instead of retaining morsel boundaries across pipelines which could easily result in skewed morsel sizes。
+每一个查询都有一个 QEPobject，会维护 pipeline 之间的依赖关系。当某个 pipeline 的依赖都执行完以后，QEPobject 会把这个 pipeline 交给 dispatcher，让后者把这个 pipeline 的 tasks 分发给不同线程。QEPobject 还负责申请用来写中间结果的临时内存。当中间结果全部完成时，会把中间结果等分成若干 morsel，作为后继任务的划分依据，这种 re-fragment 可以避免 data skew，使得每个 task 的工作量都几乎相等。原话是 after completion of the entire pipeline the temporary storage areas are logically re-fragmented into equally sized morsels; this way the succeeding pipelines start with new homogeneously sized morsels instead of retaining morsel boundaries across pipelines which could easily result in skewed morsel sizes。
 
 Note：
 1. 比如第一个和第二个 pipeline 的输出结果是一个 hash table，其实 hash table 是没法 re-fragment 的，因为 probe 端有可能访问到 hash table 里任何一条数据。不过后面会提到在一些特殊情况下 hash table 也能做到 NUMA locality 的。
@@ -87,6 +87,56 @@ Note：
 
 ![Morsel-wise processing of the probe phase](probe-pipeline.png)
 
+## Dispatcher
+
+Dispatcher 是 morsel-driven 执行框架的核心，它负责将计算资源（CPU）充分合理地分配给各个查询的 pipeline。实际有多少个 hardware thread，HyPer 就预先创建好这么多个 worker thread，然后绑定住。Dispatcher 以 task 为基本单元给各个 worker thread 分配工作。一个 task 是指一个 pipeline job（大致对应 pipeline 里的一个 operator？）加上一个 morsel input。这种执行方式一定程度上绕开了 OS 的抢占式线程调度，换用更科学的方式利用计算资源：
+
+1. Worker thread 执行的 task 的 morsel input 是在 local memory 上，充分利用了 NUMA locality。
+2. 细粒度的 task 保证了 elasticity。
+3. 细粒度且大小相同的 task 保证了 load balance 和 skew resistance。
+
+Note：
+1. 其他一些没有那么计算密集的任务（查询优化、一些后台任务之类的）可能是另开线程执行的，偶尔分到点 CPU 时间片跑跑？
+
+![Dispatcher assigns pipeline-jobs on morsels to threads depending on the core](dispatcher.png)
+
+从图中可以看到，dispatcher 维护了一个 pipeline job 的链表，表示目前可以执行的 pipeline job，然后每个 pipeline job 下面挂着不同 NUMA 节点上需要被处理的 morsels。注意同一个 query 里的 pipeline 之间存在依赖关系，在 QEPobject 中维护。一个 pipeline 只有它的依赖全部已经执行完了，它的 pipeline jobs 才能放进这个链表里。
+
+Dispatcher 调度 worker thread 去完成各种 task，这里的调度策略可以实现成各种各样的。比如最常见就是优先级调度，不同优先级分别维护自己的 pipeline job 链表，只有高优先链表空了才考虑低优先级链表。这样，一个长时间跑的 AP 查询的优先级一般比较低，它跑着跑着，一个用户希望马上得到反馈的 TP 查询进来了，优先级比较高，然后 worker thread 都优先去做 TP 查询的 task 了，很快 TP 查询就能跑完，接下来 worker thread 就继续集中于 AP 查询的 task。
+
+Dispatcher 看起来像由一个单独的线程负责，但如果这样的话，它需要一个 core 来跑，会跟 worker thread 抢时间片，尤其考虑到 morsel size 小的时候 dispatcher 的逻辑会被频繁调用。所以 dispatcher 实现成一个全局内存结构，所有调度逻辑都是通过 worker thread 被动触发执行，并通过无锁数据结构（比如 pipeline job queue 和 associated morsel queues）来保证高并发调用下调度逻辑不会成为瓶颈。被动触发的逻辑还包括：发现一个 pipeline job 没有新的 morsel input 了，要把它从链表里删掉；当发现一个 pipeline 完全完成以后，要在 QEPobject 的 DAG 里删掉它，然后把没有依赖的 pipeline 对应的 jobs 再添加到 dispatcher 的链表里。
+
+Dispatcher 还实现了 work stealing。比如一个 work thread 发现自己 NUMA 节点上的 morsel 已经没了，那么它去偷另一个 NUMA 节点上的 morsel 来执行。
+
+Note：
+1. 全局 dispatcher 的好处这么多，坏处可能就是难写，比如要无锁避免成为瓶颈，要实现成被动调用，要实现 work stealing 等等。
+2. 文中表示 work-stealing from remote sockets happens very infrequently; nevertheless it is necessary to avoid idle threads。把数据切成 morsel 均匀分配在各个 NUMA 节点上的话，确实 work stealing 不太会发生。考虑 DataSource(T)->Filter->HashBuild2，如果 DataSource(T) 的 morsel 分布是均匀的，Filter 是一个 input morsel 映射到一个 output morsel，所以 Filter 输出的 morsel 分布也是均匀的，只是每个 morsel 里的数据量可能不一样。题外话，如果经过 Filter 以后每个 morsel 都只有一行数据，是不是会造成一些性能问题，不知道有没有同一个 NUMA 节点上进行 morsel merge 的操作（output morsel 应该不会相较于 input morsel 膨胀，那 morsel split 估计不用）。
+3. 文中讲到 the writing into temporary storage will be done into NUMA local storage areas anyway。这里我其实不太了解读 remote memory 的机制，是读 remote memory 就等于拷贝到 local memory 一份吗。之后仔细研究一下。
+4. Work stealing 没做消融实验。
+
+然后作者讨论了 intra-pipeline parallelism。比如 DataSource(S)->Filter->HashBuild1 和 DataSource(T)->Filter->HashBuild2 相互没有依赖，可以并行执行（文中叫 bushy parallelism）。但作者禁止了同一个 query 里的多个 pipeline 并行执行，理由有两条：
+
+1. The number of indepen- dent pipelines is usually much smaller than the number of cores, and the amount of work in each pipeline generally differs.
+2. Bushy parallelism can decrease performance by reducing cache locality.
+
+第二条理由我能理解，但第一条我没懂是啥意思。
+
+Note：
+1. 即使在单机内存数据库里 bushy parallelism 用处有限且在 cache locality 等方面有负面作用，但我觉得 bushy parallelism 可能在其他场景下还是有价值的，比如更大规模的数据量、多节点分布式计算（对 cache locality 没那么敏感）、计算资源充足、想尽可能充分并行的场景？ 我联想到另外一个有趣的事实，很多数据库在 join reorder 的时候只考虑 left-deep tree，不考虑 bushy tree。我印象里的原因是 bushy tree 左右孩子并行执行的内存开销会很大，单节点可能撑不住，jiang'di。但多节点分布式计算的情况下通过 exchange data 可以避免单节点巨大的内存开销，这种情况下 bushy tree 应该有用武之地，简单查了一下发现 MaxCompute 是做了 bushy tree 的。有点好奇有没有论文专门讨论 bushy parallelism / bushy tree 在各个场景下的优劣以及什么场景适合。
+2. 仔细看了 HashJoin(HashJoin(Filter(R), Filter(S)), Filter(T)) 三条 pipeline 的切分，感觉似乎这种切分方式不是并行最大化的。DataSource(S)->Filter->HashBuild1 构建完第一个 probe 就可以开始做了，不需要两个 hash table 都构建完才开始第一个 probe。可能因为三条 pipeline 的切分比较简单，或者有其他方面优势，所以放弃了更充分利用并行的方式（从 HyPer 拒绝 bushy parallelism 看并行最大化并不是唯一的优化目标，有时候节约内存或者简化实现更重要）。一般来说，hash join 需要 hash table 构建完成才能开始执行 probe 端，无论是 Volcano 模型（Pull）还是 Pipeline 模型（Push）都是如此。但这里其实有个细节，有些算子从开始执行到吐出第一行可能会花费很长时间（比如一些要物化中间结果的算子，sort，topk，hash join 等），在一些优化器的代价模型里甚至有个变量描述从开始执行到吐出第一行的时间。并不是说 hash table 构建完成才能开始执行 probe 端的算子，而是 hash table 构建完成才能让 probe 端算子吐出第一行数据。所以在 hash table 构建的时候，probe 端如果是要物化中间结果的算子，也可以并行地执行起来，然后到 hash table 构建好的时候就可以立马吐出第一行数据。不太确定有没有什么数据库的实现里 build hash table 的同时会并发开始执行 probe 端。这种 bushy parallelism 能更充分地并行，但也可能带来负面作用（比如更大的内存开销）。
+
+
+
+
+
+
+
+pipeline 最优并行的方式 
+hashtable build 并行
+first row start
+
+单查询 intra-operator 并行
+join order
 
 
 volcano 模型：并发隐藏在算子里，shared state is avoided,
