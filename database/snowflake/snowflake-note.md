@@ -105,7 +105,7 @@ Snowflake 没有内存里的 buffer pool。AP 查询都要扫大量数据，维�
 
 ### Cloud Services
 
-Cloud Services 层是多租户的，有助于降成本。同时，Cloud Services 层也保证 high availability 和 scalability，我理解这里的主要难点还是 Meta Storage 要选一个保证 high availability 和 scalability 的 OLTP 数据库（FoundationDB）。
+Cloud Services 层是多租户的，有助于降成本。同时，Cloud Services 层也保证 high availability 和 scalability，我理解这里的主要难点还是 Metadata Storage 要选一个保证 high availability 和 scalability 的 OLTP 数据库（FoundationDB）。
 
 #### Query Management and Optimization
 
@@ -126,11 +126,11 @@ Note：
 
 Snowflake 没有索引，用了 min-max based pruning 来减少数据扫描量。维护每个 table file 的每个列的 min 和 max，如果 [min, max] 的区间和谓词没有交集，那么这个 table file 就可以被跳过。 Snowflake 还做了 runtime filter。
 
-### Feature Highlights
+## Feature Highlights
 
 这一部分的内容读起来更像是产品宣传手册。
 
-#### Continuous Availability
+### Continuous Availability
 
 首先是 fault resilience。用 S3 作为 Data Storage 服务以及用 FoundationDB 作为 Metadata Storage 服务，这两个存储产品本身提供了很强的 availability。Cloud Services 是多租户均摊成本的，因此跨 AZ 部署些无状态节点就行了。VW 里的 worker node 必须部署在同一个 AZ 里，这是网络吞吐对查询执行性能很重要，而 AZ 内的网络吞吐比跨 AZ 的高很多。一旦 VW 在的 AZ 挂了，那只能换个 AZ 新开 VW 了。
 
@@ -140,7 +140,7 @@ Snowflake 没有索引，用了 min-max based pruning 来减少数据扫描量�
 
 ![Online Upgrade](online-upgrade.png)
 
-#### Semi-Structured and Schema-Less Data
+### Semi-Structured and Schema-Less Data
 
 Snowflake 在 SQL 类型系统中引入了一些新类型：VARIANT、ARRAY、OBJECT，用来处理 semi-structured data。用户可以直接将 JSON、Avro、XML 格式的数据导入到 VARIANT 列中，这可以将传统的 ETL（Extract-Transform-Load）流程变成 ELT （Extract-Load-Transform），这样最后一步 Transform 就可以用 SQL 来做，充分利用 Snowflake 强大的数据处理能力，比 ETL 工具更高效。文中还提到 ETL -> ELT 的另一个优势是（我没啥数仓经验没太理解）：
 
@@ -148,19 +148,19 @@ Snowflake 在 SQL 类型系统中引入了一些新类型：VARIANT、ARRAY、OB
 
 Snowflake 提供了从 ARRAY、OBJECT 中抽取元素的函数，也提供了将 ARRAY、OBJECT 展平（SQL Lateral View）以及聚合（ARRAY_AGG、OBJECT_AGG）的函数，还提供了 CAST 函数将 VARIANT 类型转成基本类型。用户可以利用这些原生的函数方便地操作 semi-structured data。
 
-Semi-structured data 序列化以后很难用上列存优化技术，这也是倾向于将 semi-structured data 转成 plain relational data 的动机。Snowflake 用了一个不依赖 schema 的对 semi-structured data 进行列存优化的方法。在写一个 table file 的时候，会对 semi-structured data 进行统计信息，自动推导类型并找出最常见的 (typed) paths。然后这些最常见的 paths 就从 document 中被抽出来当做单独的列来存，这样就能用上列存优化了。Snowflake 还把 semi-structured data 的每一条 path 都用 Bloom filter 记录下来，如果查询指定的 path 在这个 table file 里根本没出现，那么这个 table file 可以直接跳过。
+Semi-structured data 序列化以后很难用上列存优化技术，这也是倾向于将 semi-structured data 转成 plain relational data 的动机。Snowflake 用了一个不依赖 schema 的对 semi-structured data 进行列存优化的方法。在写一个 table file 的时候，会对 semi-structured data 进行统计分析，自动推导类型并找出最常见的 (typed) paths。然后这些最常见的 paths 就从 document 中被抽出来当做单独的列来存，这样就能用上列存优化了。Snowflake 还把 semi-structured data 的每一条 path 都用 Bloom filter 记录下来，如果查询指定的 path 在这个 table file 里根本没出现，那么这个 table file 可以直接跳过。
 
 Snowflake 还做了 optimistic conversion。比如在 JSON 或者 XML 里 date/time 是存成 string 的，我们会把这种 string 转成 date/time 类型存一份。如果查询带了 cast string to date/time，那么直接用存成 date/time 的那一列就行，避免了查询时的 cast。
 
 在做了 columnar storage、optimistic conversion、pruning over semi-structured data 这些优化以后，作者做了个实验证明在 semi-structured data 上查询性能只比 plain relational data 上慢 10%。
 
-#### Time Travel and Cloning
+### Time Travel and Cloning
 
 因为 Snowflake 用 MVCC 实现了 SI，所以只要数据还没 GC，我们就可以读到过去某个时间点的 snapshot，作者把这个功能叫做 time travel。类似地，也很容易实现对删库删表的撤回功能。
 
 因为 table file 是不可变的，所以可以用 COW 的方式实现 CLONE 的功能。
 
-#### Security
+### Security
 
 文中还花较长篇幅强调 Snowflake 的安全性，但我对这方面没太多了解，所以就不展开了。
 
@@ -168,9 +168,9 @@ Snowflake 还做了 optimistic conversion。比如在 JSON 或者 XML 里 date/t
 
 这部分还挺有意思的，我摘抄了一些：
 
-> When Snowflake was founded in 2012, the database world was fully focused on SQL on Hadoop, with over a dozen systems appearing within a short time span. At that time, the decision to work in a completely different direction, to build a “classic” data warehouse system for the cloud, seemed a contrarian and risky move.
+> When Snowflake was founded in 2012, the database world was fully focused on SQL on Hadoop, with over a dozen systems appearing within a short time span. At that time, the decision to work in a completely different direction, to build a "classic" data warehouse system for the cloud, seemed a contrarian and risky move.
 
-> we did make avoidable mistakes along the way, including overly simplistic early implementations of some relational operators, not incorporating all datatypes early on in the engine, not early-enough focus on resource management, postponing work on comprehensive date and time functionality etc.
+> We did make avoidable mistakes along the way, including overly simplistic early implementations of some relational operators, not incorporating all datatypes early on in the engine, not early-enough focus on resource management, postponing work on comprehensive date and time functionality etc.
 
 > Our continuous focus on avoiding tuning knobs raised a series of engineering challenges, ultimately bringing about many exciting technical solutions. Snowflake has only one tuning parameter: how much performance the user wants (and is willing to pay for).
 
