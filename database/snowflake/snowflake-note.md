@@ -88,14 +88,46 @@ Note：
 
 #### Local Caching and File Stealing
 
-If the set of nodes changes; either as a result of node failures, or because the user chooses to resize the system; large amounts of data need to be reshuffled. Since the very same nodes are responsible for both data shuffling and query processing, a sig- nificant performance impact can be observed, limiting elasticity and availability.
-三副本保证高可用
+每个 worker node 会在 local disk 上对来自 S3 的表数据进行缓存。考虑到 worker node 只会读查询需要的若干列而不是所有列，缓存的基本单位是 table file header 加这个 table file 里的某列数据。然后采用的是 LRU 策略。
 
+为了提供 cache hit rate 以及避免同一个 table file 在多个 worker node 的 local disk 上都存一份的冗余，Snowflake 会根据 table file name 来做 consistent hashing。当有 worker node 失败或者退出的时候，不需要像 shared-nothing 架构那样递交自己的数据给其他节点，这些数据逻辑归属给了其他 worker node，然后等查询实际要访问这些数据的时候其他 worker node 会从 S3 里加载到各自的 local disk 里。这种 lazy 的方式让 worker node 退出对性能影响较小（顶多 cache hit rate 受点影响），提高了 availability。
+
+Note：
+1. 文中提到采用 consistent hashing 以后，subsequent or concurrent queries accessing the same table file will therefore do this on the same worker node。Consistent hashing 规定了一个 table file 逻辑归属于哪个 worker node（即使没加载到 local disk 上），优化器根据这种分布情况来决定每个 worker node 的读数据任务。感觉还可以进一步利用这种分布情况来规划执行计划，减少网络开销，提供查询性能。
+
+Skew handling 是对各种 AP 系统来说都很重要。总有些节点因为虚拟化或者网络等原因拖慢整体的进度。Snowflake 对 scan-level skew 做了处理。动作快的 process 在完成自己的 scan tasks 后，就会发请求给同一个查询的其他 process 尝试领新的任务。动作慢的 process 发现自己还有好多 scan tasks 没做，就会应答请求把其中一个 table file 的 scan task 递交给别人。动作快的 process 从别人那里领来新的 scan task 以后直接从 S3 拉数据，避免给动作慢的 process 造成更多负担。
+
+#### Execution Engine
+
+作为一个现代的 AP 系统，Snowflake 采用了 columnar、vectorized、push-based 这些常见的技术，这里不展开了，等下次仔细读完那几篇再写。
+
+Snowflake 没有内存里的 buffer pool。AP 查询都要扫大量数据，维护 buffer pool 的意义不大（比如 mysql 的缓存策略里其实是不希望 table full scan 的大量 page 进 buffer pool 造成缓存污染的），不如省下内存给查询执行用（AP 查询可能会吃掉大量内存放中间结果，比如 hash join/agg、sort 等）。Snowflake 支持中间结果的落盘来避免 OOM。尽管内存型的 AP 数据库会更高效更快，它们无法支持更大量级的 workload。
+
+### Cloud Services
+
+Cloud Services 层是多租户的，有助于降成本。同时，Cloud Services 层也保证 high availability 和 scalability，我理解这里的主要难点还是 Meta Storage 要选一个保证 high availability 和 scalability 的 OLTP 数据库（FoundationDB）。
+
+#### Query Management and Optimization
+
+Snowflake 的查询优化器是 cascades-style 的。统计信息在数据加载和更新的时候自动维护的（有点好奇有些统计信息怎么做增量更新，比如直方图和 NDV）。Snowflake 还把一些执行计划的细节推迟到执行阶段再做决策，比如 the type of data distribution for joins，我理解应该是比如 broadcast vs hash partition 这样的选择。这种推迟到执行阶段的决策虽然在性能上会有些损耗，但能减少执行计划出错的概率，提供更稳定可预测的性能（之后想看看这一部分的具体实现和细节）。执行计划会下发到各个 worker node 去执行，在执行时 Cloud Services 会从各个 worker node 收集各种 execution information，帮助性能诊断和问题排查。
+
+#### Concurrency Control
+
+并发控制也是有 Cloud Services 层处理的。Snowflake 用 MVCC 的方式实现了 Snapshot Isolation（SI） 的隔离级别。因为 S3 上的 table file 是不可变的，更新数据是用创建新的 table file 的方式，所以用 table file 为单位做 MVCC 很自然。每个 table file 的版本信息维护在 Metadata Storage 里，这样就能知道查询该读哪个版本的 table file，以及旧版本的 table file 什么时候可以 GC。
+
+Note：
+1. 当时的 Snowflake 执行小的写操作（trickle insert/update）的性能应该是比较差的，因为一个很小的写操作都要在 S3 上写一个新的 table file。文中提到了后面可能引入 redo-undo log 和 delta store 来优化。
+
+#### Pruning
+
+
+
+
+table file 的大小
 
 写回 s3
 写性能差，local disk 什么时候写回 s3，还是只写 wal 就行
 
-省存储成本
 
 
 上云更好地搜集 workload 并进行调整
@@ -113,10 +145,9 @@ VW 是隔离单位
 
 共享 VW 提高利用率
 
-云最大的特点就是资源弹性
 
-improve the hit rate
-avoid redundant caching 
+
+
 
 用了 consistent hashing
 分布均匀，且能容忍节点加入或者删除
@@ -128,13 +159,12 @@ avoid redundant caching
 优化器怎么感知？cache hit rate， sense data distribution
 不同表数据之间怎么做 cache 管理
 
-但 file-stealing 不会去找其他 worker，是直接读 s3
 
 优化器怎么切分任务给各个 worker locality
 
 resulting in much better availability than an eager cache or a pure shared-nothing system which would need to immediately shuffle large amounts of table data across nodes
 
-shared-nothing 架构没有 s3 作为 ground truth，有节点退出必须交接数据
+
 
 There is little value in being able to execute a query over 1,000 nodes if another system can do it in the same time using 10 such nodes.
 
