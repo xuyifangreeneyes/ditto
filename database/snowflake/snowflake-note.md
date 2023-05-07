@@ -16,7 +16,7 @@ Snowflake 有如下特点：
 
 1. Pure Software-as-a-Service (SaaS) Experience：开箱即用，简单易用，不需要买机器部署，不需要 DBA，不用调参数，不用执行数据的物理分布，不需要进行 storage grooming 的操作（数据备份、归档、删除、压缩、移动等）。
 2. Relational：完整支持 ANSI SQL 和 ACID，无痛上车。作者还在 related work 里吐槽了 BigQuery 只支持狗家自己的 SQL 方言。
-3. Semi-Structured：支持 JSON、Avro 等 semi-structured 数据，提供原生的操作 semi-structured 数据的函数和 SQL 语法，进行自动的类型转换和列存优化，让操作 semi-structured 数据的性能接近关系型数据。
+3. Semi-Structured：支持 JSON、Avro 等 semi-structured data，提供原生的操作 semi-structured data 的函数和 SQL 语法，进行自动的类型转换和列存优化，让操作 semi-structured data 的性能接近 plain relational data。
 4. Elastic：计算和存储资源都可以独立扩展，且在扩展的时候不会影响可用性和性能。
 5. Highly Available：可以容忍节点甚至整个数据中心的失败，软硬件升级的时候也不影响可用性。
 6. Durable：数据存 S3 上不会丢，外加有复制、备份、闪回之类的保险措施。
@@ -109,7 +109,11 @@ Cloud Services 层是多租户的，有助于降成本。同时，Cloud Services
 
 #### Query Management and Optimization
 
-Snowflake 的查询优化器是 cascades-style 的。统计信息在数据加载和更新的时候自动维护的（有点好奇有些统计信息怎么做增量更新，比如直方图和 NDV）。Snowflake 还把一些执行计划的细节推迟到执行阶段再做决策，比如 the type of data distribution for joins，我理解应该是比如 broadcast vs hash partition 这样的选择。这种推迟到执行阶段的决策虽然在性能上会有些损耗，但能减少执行计划出错的概率，提供更稳定可预测的性能（之后想看看这一部分的具体实现和细节）。执行计划会下发到各个 worker node 去执行，在执行时 Cloud Services 会从各个 worker node 收集各种 execution information，帮助性能诊断和问题排查。
+Snowflake 的查询优化器是 cascades-style 的。统计信息在数据加载和更新的时候自动维护的。Snowflake 还把一些执行计划的细节推迟到执行阶段再做决策，比如 the type of data distribution for joins，我理解应该是比如 broadcast vs hash partition 这样的选择。这种推迟到执行阶段的决策虽然在性能上会有些损耗，但能减少执行计划出错的概率，提供更稳定可预测的性能。执行计划会下发到各个 worker node 去执行，在执行时 Cloud Services 会从各个 worker node 收集各种 execution information，帮助性能诊断和问题排查。
+
+Note：
+1. 好奇有些统计信息怎么做增量更新，比如直方图和 NDV。猜测是因为 table file level stats 比较好维护，global level stats 由 table file level stats 汇聚而成。
+2. 之后想看看 adaptive execution 这部分的实现和细节。
 
 #### Concurrency Control
 
@@ -120,173 +124,67 @@ Note：
 
 #### Pruning
 
+Snowflake 没有索引，用了 min-max based pruning 来减少数据扫描量。维护每个 table file 的每个列的 min 和 max，如果 [min, max] 的区间和谓词没有交集，那么这个 table file 就可以被跳过。 Snowflake 还做了 runtime filter。
 
+### Feature Highlights
 
+这一部分的内容读起来更像是产品宣传手册。
+
+#### Continuous Availability
+
+首先是 fault resilience。用 S3 作为 Data Storage 服务以及用 FoundationDB 作为 Metadata Storage 服务，这两个存储产品本身提供了很强的 availability。Cloud Services 是多租户均摊成本的，因此跨 AZ 部署些无状态节点就行了。VW 里的 worker node 必须部署在同一个 AZ 里，这是网络吞吐对查询执行性能很重要，而 AZ 内的网络吞吐比跨 AZ 的高很多。一旦 VW 在的 AZ 挂了，那只能换个 AZ 新开 VW 了。
+
+![Multi-Data Center Instance of Snowflake](mul-data-center.png)
+
+然后是 online upgrade。类似地，存储方面（Data Storage 和 Metadata Storage）交给 S3 和 FoundationDB 就行。Snowflake 的代码主要是部署在剩下的无状态节点（包括 VW 里的 worker node 和 Cloud Services 里的无状态节点）上，它们的升级很好处理。Snowflake 升级的时候会启动新版本的无状态节点，构成一个完整的新版本服务，然后渐进地把用户的连接和查询从旧版本服务切换到新版本服务，保证连接不断，查询不失败（即已经在旧版本服务上跑的查询就让它跑完，新来的查询跑在新版本服务上）。值得一提的是，新版本的 VW 和旧版本的 VW 会共享同一个 worker node，以及 worker node 的 local disk 上的数据缓存，这样升级的时候甚至不用重新从 S3 上拉数据缓存到 local disk 上。有这样丝滑、用户无感、性能不受影响的 online upgrade，Snowflake 平均每周升级一次，实现产品的快速迭代。当发现新版本有 critical bug 的时候还可以快速 online downgrade 到旧版本，修完再 online upgrade。
+
+![Online Upgrade](online-upgrade.png)
+
+#### Semi-Structured and Schema-Less Data
+
+Snowflake 在 SQL 类型系统中引入了一些新类型：VARIANT、ARRAY、OBJECT，用来处理 semi-structured data。用户可以直接将 JSON、Avro、XML 格式的数据导入到 VARIANT 列中，这可以将传统的 ETL（Extract-Transform-Load）流程变成 ELT （Extract-Load-Transform），这样最后一步 Transform 就可以用 SQL 来做，充分利用 Snowflake 强大的数据处理能力，比 ETL 工具更高效。文中还提到 ETL -> ELT 的另一个优势是（我没啥数仓经验没太理解）：
+
+>This approach, aptly called "schema later" in the literature, allows for schema evolution by decoupling information producers from information consumers and any intermediaries.
+
+Snowflake 提供了从 ARRAY、OBJECT 中抽取元素的函数，也提供了将 ARRAY、OBJECT 展平（SQL Lateral View）以及聚合（ARRAY_AGG、OBJECT_AGG）的函数，还提供了 CAST 函数将 VARIANT 类型转成基本类型。用户可以利用这些原生的函数方便地操作 semi-structured data。
+
+Semi-structured data 序列化以后很难用上列存优化技术，这也是倾向于将 semi-structured data 转成 plain relational data 的动机。Snowflake 用了一个不依赖 schema 的对 semi-structured data 进行列存优化的方法。在写一个 table file 的时候，会对 semi-structured data 进行统计信息，自动推导类型并找出最常见的 (typed) paths。然后这些最常见的 paths 就从 document 中被抽出来当做单独的列来存，这样就能用上列存优化了。Snowflake 还把 semi-structured data 的每一条 path 都用 Bloom filter 记录下来，如果查询指定的 path 在这个 table file 里根本没出现，那么这个 table file 可以直接跳过。
+
+Snowflake 还做了 optimistic conversion。比如在 JSON 或者 XML 里 date/time 是存成 string 的，我们会把这种 string 转成 date/time 类型存一份。如果查询带了 cast string to date/time，那么直接用存成 date/time 的那一列就行，避免了查询时的 cast。
+
+在做了 columnar storage、optimistic conversion、pruning over semi-structured data 这些优化以后，作者做了个实验证明在 semi-structured data 上查询性能只比 plain relational data 上慢 10%。
+
+#### Time Travel and Cloning
+
+因为 Snowflake 用 MVCC 实现了 SI，所以只要数据还没 GC，我们就可以读到过去某个时间点的 snapshot，作者把这个功能叫做 time travel。类似地，也很容易实现对删库删表的撤回功能。
+
+因为 table file 是不可变的，所以可以用 COW 的方式实现 CLONE 的功能。
+
+#### Security
+
+文中还花较长篇幅强调 Snowflake 的安全性，但我对这方面没太多了解，所以就不展开了。
+
+## Lessons Learned And Outlook
+
+这部分还挺有意思的，我摘抄了一些：
+
+> When Snowflake was founded in 2012, the database world was fully focused on SQL on Hadoop, with over a dozen systems appearing within a short time span. At that time, the decision to work in a completely different direction, to build a “classic” data warehouse system for the cloud, seemed a contrarian and risky move.
+
+> we did make avoidable mistakes along the way, including overly simplistic early implementations of some relational operators, not incorporating all datatypes early on in the engine, not early-enough focus on resource management, postponing work on comprehensive date and time functionality etc.
+
+> Our continuous focus on avoiding tuning knobs raised a series of engineering challenges, ultimately bringing about many exciting technical solutions. Snowflake has only one tuning parameter: how much performance the user wants (and is willing to pay for).
+
+Note：
+1. 不太确定 Snowflake 对 no knob tuning 是不是太过于执着了，很多系统设计没有 knob 的情况下只能给一个折中的方案。是不是也可以考虑用一些 auto knob tuning 的方案呢。 
+
+> Somewhat unexpected though, core performance turned out to be almost never an issue for our users. The reason is that elastic compute via virtual warehouses can offer the performance boost occasionally needed.
+
+no physical design 自动做 data partition，性能会差一些吗
+
+We are currently working on improving the data access performance by providing additional metadata structures and data re-organization tasks—with a focus on minimal to no user interaction.
 
 table file 的大小
-
-写回 s3
-写性能差，local disk 什么时候写回 s3，还是只写 wal 就行
-
-
-
-上云更好地搜集 workload 并进行调整
-
-tikv 多租户难做，S3 怎么做的
-
-snowflake 需要一个怎么样的存储层
-S3 的 iops cpu 等等
-
-中间结果保存 类似 spart
-
-It is common for Snowflake users to have several VWs for queries from different organizational units, often running continuously, and periodically launch on-demand VWs, for instance for bulk loading.
-
-VW 是隔离单位
-
-共享 VW 提高利用率
-
-
-
-
-
-用了 consistent hashing
-分布均匀，且能容忍节点加入或者删除
-本地命中，没命中先找其他 worker，没有再去 s3
-怎么跟多版本协调？将多版本看做不同的个体
-
-"Eager cache" 通常指的是一种缓存机制，其中缓存项在首次访问时就会被立即加载到缓存中，而不是在需要时才进行加载。相对于“懒惰缓存”（lazy cache）需要在第一次访问缓存项时才进行加载，eager cache 有助于提高访问速度和性能，因为缓存项已经预加载到内存中，可以快速地响应后续的请求。但是，eager cache 的缺点是，它可能会占用大量的内存空间，因为它需要在缓存中存储所有的预加载数据。因此，eager cache 应该在适当的时候使用，并且需要注意内存使用情况，以避免出现内存不足的情况。
-
-优化器怎么感知？cache hit rate， sense data distribution
-不同表数据之间怎么做 cache 管理
-
-
-优化器怎么切分任务给各个 worker locality
-
-resulting in much better availability than an eager cache or a pure shared-nothing system which would need to immediately shuffle large amounts of table data across nodes
-
-
-
-There is little value in being able to execute a query over 1,000 nodes if another system can do it in the same time using 10 such nodes.
-
-creating additional opportunities for sharing and pipelining of intermediate results
-
-pipeline 的中间结果？
-
-Most queries scan large amounts of data. Using memory for table buffering versus operation is a bad trade-off here.
-
-对于大查询来说，保留 page 在内存 buffer 里还不如留着内存做计算。即使 mysql 对查询的 buffer 好像也是比较谨慎的。
-
-a pure main-memory engine, while leaner and perhaps faster, is too restrictive to handle all interesting workloads. Analytic workloads can feature extremely large joins or aggregations.
-
-成本对比
-
-连接保持？load balance？
-
-The plan space is further reduced by postponing many decisions until execution time, for example the type of data distribution for joins.
-数据怎么发 broadcast join or shuffle join
-
-
-adaptive execution
-
-Changes to a file can only be made by replacing it with a different file that includes the changes
-
-It would certainly be possible to defer changes to table files through the introduction of a redo-undo log, perhaps in combination with a delta store
-
-看起来就是写流程做的很简单
-
-File additions and removals are tracked in the metadata (in the global key-value store), in a form which allows the set of files that belong to a specific table version to be computed very efficiently.
-
-总觉得 file 自己得维护一些版本链的信息，但似乎都存 meta store 了，oltp meta store point 读写性能更好
-
-
-min-max based pruning 
-多大程度有效
-又记一个可以抄进 tidb 的东西（划掉，tiflash 已经有了
-塞个 bloom filter 也不是不行
-
-感觉这跟 partition 也相关
-
-Here, the system maintains the data distribution information for a given chunk of data (set of records, file, block etc.), in particular minimum and max- imum values within the chunk.
-
-看起来是写在 meta store 里？如果写在 file 里每个 file 还是要读
-
-runtime filter
-
-二八原则
-s3 本地盘缓存 比全用本地盘慢不了太多？
-
-the UI allows not only SQL opera- tions, but also gives access to the database catalog, user and system management, monitoring, usage information
-
-诊断、支持
-
-storage grooming tasks
-备份、归档、删除、压缩、移动
-
-metadata store is also dis- tributed and replicated across multiple AZs
-
-foundationdb
-Building a metadata layer that can support hundreds of users concur- rently was a very challenging and complex task
-
-session 应该在 cloud service 或者 load balancer 那一层，更像在后者？
-
-升降级是否可怕取决于工程管理
-
-easier etl ETL 会占用更多的存储，这也跟 s3 存储便宜有关？
-这部分市场（ETL 工具）也可以被 snowflake 吃下？
 
 The internal encoding makes extraction very efficient. A child element is just a pointer inside the parent element; no copying is required.
 
 按理说序列化之后没法拿到指针，反序列化以后才行，还是说存磁盘的 encode 是特别设计过的，还是可以拿到指针？
-
-SQL Lateral View 是一种在 Hive 和 Spark SQL 中使用的特殊操作，用于展开复杂数据结构中的元素，以便更方便地进行数据分析。Lateral View 可以将嵌套的数据结构（例如数组、Map 和 Struct）展开为行格式，这样可以更轻松地进行查询和分析。
-
-To assess the combined effects of columnar storage, opti- mistic conversion, and pruning over semi-structured data on query performance
-消融实验
-
-
-time travel
-用的场景，误删
-
-90 天不 gc？s3 成本低？
-
-
-no configuration or management
-
-hierarchical key model
-
-constrain the amount of data each key protects
-ensures isolation of user data in its multi-tenant architecture, because each user account has a separate account key
-
-redshift share-nothing
-
-mpp 数据库为啥不做中间结果落盘，影响性能？即使落盘，出发点也是降低内存使用避免 oom 等，不是出于计算结果的复用
-或者说不落盘也可以做重试，可能抽象的好一点就行？或者是因为大数据的机器比较破比较多，总体失败率比较高
-
-自动做 data partition，性能会差一些吗
-
-不是支持了 json 就是文档数据库了，存储和计算要对 semi-structure data 做优化，否则性能很差
-
-core performance turned out to be almost never an issue for our users
-性能不是用户选择产品的唯一因素
-The reason is that elastic compute via virtual warehouses can offer the perfor- mance boost occasionally needed.
-性能不行就加机器
-
-skew handling and load balancing strategies, whose impor- tance increases along with the scale of our users’ workloads.
-
-
-
-the transi- tion to a full self-service model, where users can sign up and interact with the system without our involvement at any phase.
-
-no tuning knob 是其中的一点
-
-htap 做法，应用场景
-
-
-
-delta 结构？
-
-物化
-
-升级在云上更重要更频繁
-
-cost 比较
